@@ -2,76 +2,99 @@ package globalcomix
 
 import (
 	"context"
-	"net/url"
-	"strings"
 
 	"github.com/tamnd/any-cli/kit"
 	"github.com/tamnd/any-cli/kit/errs"
 )
 
-// domain.go exposes globalcomix as a kit Domain: a driver that a multi-domain
-// host (ant) enables with a single blank import,
+// domain.go exposes globalcomix as a kit Domain.
+//
+// A multi-domain host enables this driver with:
 //
 //	import _ "github.com/tamnd/globalcomix-cli/globalcomix"
-//
-// exactly as a database/sql program enables a driver with `import _
-// "github.com/lib/pq"`. The init below registers it; the host then dereferences
-// globalcomix:// URIs by routing to the operations Register installs. The same
-// Domain also builds the standalone gc binary (see cli.NewApp), so the
-// binary and a host share one source of truth.
-//
-// This is the scaffold's starting point: one resource type, "page", served by a
-// resolver op and a list op. Add your real types here as you model the site.
 func init() { kit.Register(Domain{}) }
 
-// Domain is the globalcomix driver. It carries no state; the per-run client is
-// built by the factory Register hands kit.
+// Domain is the GlobalComix driver.
 type Domain struct{}
 
-// Info describes the scheme, the hostnames a pasted link is matched against, and
-// the identity reused for the binary's help and version.
+// Info describes the scheme and identity.
 func (Domain) Info() kit.DomainInfo {
 	return kit.DomainInfo{
-		Scheme: "globalcomix",
-		Hosts:  []string{Host},
+		Scheme:  "globalcomix",
+		Aliases: []string{"gc"},
+		Hosts:   []string{Host, "www.globalcomix.com"},
 		Identity: kit.Identity{
 			Binary: "gc",
 			Short:  "Browse GlobalComix comics catalog",
-			Long: `Browse GlobalComix comics catalog
+			Long: `gc turns globalcomix.com into a fast, scriptable command line.
 
-gc reads public globalcomix data over plain HTTPS, shapes it into
-clean records, and prints output that pipes into the rest of your tools. No API
-key, nothing to run alongside it.`,
+Browse trending and new comics, search the catalog, and fetch chapter lists
+from GlobalComix's large free online library.
+
+Quick start:
+  gc trending -n 10               trending comics
+  gc new -n 5                     newly added comics
+  gc search "spider-man"          search by title
+  gc comic one-piece-fan          comic details
+  gc chapters one-piece-fan -n 5  chapter list`,
 			Site: Host,
 			Repo: "https://github.com/tamnd/globalcomix-cli",
 		},
 	}
 }
 
-// Register installs the client factory and every operation onto app. A resolver
-// op (Single) names its own record type and answers `ant get`; a List op
-// enumerates a parent resource's members and answers `ant ls`.
+// Register installs the client factory and all operations onto app.
 func (Domain) Register(app *kit.App) {
 	app.SetClient(newClient)
 
-	// Resolver op: one record per id, the home of `gc page` and
-	// `ant get globalcomix://page/<id>`.
-	kit.Handle(app, kit.OpMeta{Name: "page", Group: "read", Single: true,
-		Summary: "Fetch a page by path or URL", URIType: "page", Resolver: true,
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, getPage)
+	kit.Handle(app, kit.OpMeta{
+		Name:    "trending",
+		Group:   "browse",
+		List:    true,
+		Summary: "List trending comics",
+	}, trendingOp)
 
-	// List op: members of a page, the home of `gc links` and `ant ls`.
-	// It emits page stubs, so every listed member is itself an addressable
-	// globalcomix://page/ URI a host can follow.
-	kit.Handle(app, kit.OpMeta{Name: "links", Group: "read", List: true,
-		Summary: "List the pages a page links to", URIType: "page",
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, listLinks)
+	kit.Handle(app, kit.OpMeta{
+		Name:    "new",
+		Group:   "browse",
+		List:    true,
+		Summary: "List newly added comics",
+	}, newOp)
+
+	kit.Handle(app, kit.OpMeta{
+		Name:    "search",
+		Group:   "browse",
+		List:    true,
+		Summary: "Search the GlobalComix catalog",
+		Args: []kit.Arg{
+			{Name: "query", Help: "search query"},
+		},
+	}, searchOp)
+
+	kit.Handle(app, kit.OpMeta{
+		Name:    "comic",
+		Group:   "browse",
+		Single:  true,
+		Summary: "Fetch comic details by slug",
+		Args: []kit.Arg{
+			{Name: "slug", Help: "comic slug (from the URL)"},
+		},
+	}, comicOp)
+
+	kit.Handle(app, kit.OpMeta{
+		Name:    "chapters",
+		Group:   "browse",
+		List:    true,
+		Summary: "List chapters for a comic",
+		Args: []kit.Arg{
+			{Name: "slug", Help: "comic slug"},
+		},
+	}, chaptersOp)
 }
 
-// newClient builds the client from the host-resolved config, so a host and the
-// standalone binary pace and identify themselves the same way.
+// newClient builds a *Client from the kit-resolved config.
 func newClient(_ context.Context, cfg kit.Config) (any, error) {
-	c := NewClient()
+	c := DefaultConfig()
 	if cfg.UserAgent != "" {
 		c.UserAgent = cfg.UserAgent
 	}
@@ -82,92 +105,120 @@ func newClient(_ context.Context, cfg kit.Config) (any, error) {
 		c.Retries = cfg.Retries
 	}
 	if cfg.Timeout > 0 {
-		c.HTTP.Timeout = cfg.Timeout
+		c.Timeout = cfg.Timeout
 	}
-	return c, nil
+	return NewClient(c), nil
 }
 
-// --- inputs ---
-//
-// Each handler takes a typed input struct. kit fills the fields from the tags:
-// kit:"arg" is a positional argument, kit:"flag,inherit" binds the framework's
-// shared flag of the same name, and kit:"inject" receives the client newClient
-// builds.
+// ---- input structs ----
 
-type pageRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
-	Client *Client `kit:"inject"`
-}
-
-type listRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
+type listingInput struct {
+	Page   int     `kit:"flag" help:"page number (1-indexed)" default:"1"`
 	Limit  int     `kit:"flag,inherit" help:"max results"`
 	Client *Client `kit:"inject"`
 }
 
-// --- handlers ---
-
-func getPage(ctx context.Context, in pageRef, emit func(*Page) error) error {
-	p, err := in.Client.GetPage(ctx, pagePath(in.Ref))
-	if err != nil {
-		return mapErr(err)
-	}
-	return emit(p)
+type searchInput struct {
+	Query  string  `kit:"arg"  help:"search query"`
+	Page   int     `kit:"flag" help:"page number (1-indexed)" default:"1"`
+	Limit  int     `kit:"flag,inherit" help:"max results"`
+	Client *Client `kit:"inject"`
 }
 
-func listLinks(ctx context.Context, in listRef, emit func(*Page) error) error {
-	pages, err := in.Client.PageLinks(ctx, pagePath(in.Ref), in.Limit)
+type comicInput struct {
+	Slug   string  `kit:"arg"    help:"comic slug"`
+	Client *Client `kit:"inject"`
+}
+
+type chaptersInput struct {
+	Slug   string  `kit:"arg"    help:"comic slug"`
+	Limit  int     `kit:"flag,inherit" help:"max chapters"`
+	Client *Client `kit:"inject"`
+}
+
+// ---- handlers ----
+
+func trendingOp(ctx context.Context, in listingInput, emit func(*Comic) error) error {
+	comics, err := in.Client.Trending(ctx, in.Page)
 	if err != nil {
 		return mapErr(err)
 	}
-	for _, p := range pages {
-		if err := emit(p); err != nil {
+	if len(comics) == 0 {
+		return errs.NotFound("no trending comics found")
+	}
+	return emitComics(comics, in.Limit, emit)
+}
+
+func newOp(ctx context.Context, in listingInput, emit func(*Comic) error) error {
+	comics, err := in.Client.New(ctx, in.Page)
+	if err != nil {
+		return mapErr(err)
+	}
+	if len(comics) == 0 {
+		return errs.NotFound("no new comics found")
+	}
+	return emitComics(comics, in.Limit, emit)
+}
+
+func searchOp(ctx context.Context, in searchInput, emit func(*Comic) error) error {
+	comics, err := in.Client.Search(ctx, in.Query, in.Page)
+	if err != nil {
+		return mapErr(err)
+	}
+	if len(comics) == 0 {
+		return errs.NotFound("no results for %q", in.Query)
+	}
+	return emitComics(comics, in.Limit, emit)
+}
+
+func comicOp(ctx context.Context, in comicInput, emit func(*ComicDetail) error) error {
+	detail, err := in.Client.GetComic(ctx, in.Slug)
+	if err != nil {
+		return mapErr(err)
+	}
+	return emit(detail)
+}
+
+func chaptersOp(ctx context.Context, in chaptersInput, emit func(*Chapter) error) error {
+	chapters, err := in.Client.GetChapters(ctx, in.Slug)
+	if err != nil {
+		return mapErr(err)
+	}
+	if len(chapters) == 0 {
+		return errs.NotFound("no chapters found for %q", in.Slug)
+	}
+	limit := in.Limit
+	if limit > 0 && limit < len(chapters) {
+		chapters = chapters[:limit]
+	}
+	for i := range chapters {
+		if err := emit(&chapters[i]); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// --- Resolver: the URI-native string functions, pure and network-free ---
-
-// Classify turns any accepted input — a bare path or a full globalcomix.com URL —
-// into the canonical (type, id), so `ant resolve` and `ant url` touch no network.
-func (Domain) Classify(input string) (uriType, id string, err error) {
-	id = pagePath(input)
-	if id == "" {
-		return "", "", errs.Usage("unrecognized globalcomix reference: %q", input)
+func emitComics(comics []Comic, limit int, emit func(*Comic) error) error {
+	if limit > 0 && limit < len(comics) {
+		comics = comics[:limit]
 	}
-	return "page", id, nil
+	for i := range comics {
+		if err := emit(&comics[i]); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
-// Locate is the inverse: the live https URL for a (type, id).
-func (Domain) Locate(uriType, id string) (string, error) {
-	if uriType != "page" {
-		return "", errs.Usage("globalcomix has no resource type %q", uriType)
-	}
-	return BaseURL + "/" + strings.Trim(id, "/"), nil
-}
-
-// --- helpers ---
-
-// pagePath turns any accepted input into the canonical page id: the path of a
-// full URL on this host, or a bare path with its slashes trimmed.
-func pagePath(input string) string {
-	input = strings.TrimSpace(input)
-	if u, err := url.Parse(input); err == nil && (u.Scheme == "http" || u.Scheme == "https") {
-		return strings.Trim(u.Path, "/")
-	}
-	return strings.Trim(input, "/")
-}
-
-// mapErr converts a library error into the kit error kind that carries the right
-// exit code, so a host renders the same outcomes the standalone binary does. As
-// you add sentinel errors to the library, map them here, for example:
-//
-//	case errors.Is(err, ErrNotFound):
-//		return errs.NotFound("%s", err.Error())
-//	case errors.Is(err, ErrRateLimited):
-//		return errs.RateLimited("%s", err.Error())
+// mapErr converts library errors into kit error kinds.
 func mapErr(err error) error {
-	return err
+	switch {
+	case err == nil:
+		return nil
+	case err == ErrNotFound:
+		return errs.NotFound("%s", err.Error())
+	default:
+		return err
+	}
 }
