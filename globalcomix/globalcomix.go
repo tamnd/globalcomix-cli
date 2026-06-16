@@ -1,70 +1,101 @@
 // Package globalcomix is the library behind the gc command line:
-// the HTTP client, request shaping, and the typed data models for globalcomix.
+// the HTTP client, HTML parsing, and typed data models for globalcomix.com.
 //
-// The Client here is the spine every command shares. It sets a real
-// User-Agent, paces requests so a busy session stays polite, and retries the
-// transient failures (429 and 5xx) that any public site throws under load.
-// Build your endpoint calls and JSON decoding on top of it.
+// GlobalComix serves server-rendered HTML at legacy /a/ paths.
+// The client parses these pages using Go's x/net/html package.
+// No API key or authentication is required for public catalog pages.
 package globalcomix
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
-	"regexp"
 	"strings"
+	"sync"
 	"time"
+
+	"golang.org/x/net/html"
 )
 
-// DefaultUserAgent identifies the client to globalcomix. A real, honest
-// User-Agent is both polite and the thing most likely to keep you unblocked.
-const DefaultUserAgent = "gc/dev (+https://github.com/tamnd/globalcomix-cli)"
-
-// Host is the site this client talks to, and the host the URI driver in
-// domain.go claims. The scaffold points it at globalcomix.com; change it once you
-// know the real endpoints you want to read.
+// Host is the GlobalComix hostname.
 const Host = "globalcomix.com"
 
 // BaseURL is the root every request is built from.
 const BaseURL = "https://" + Host
 
-// Client talks to globalcomix over HTTP.
-type Client struct {
-	HTTP      *http.Client
-	UserAgent string
-	// Rate is the minimum gap between requests. Zero means no pacing.
-	Rate    time.Duration
-	Retries int
+// DefaultUserAgent identifies the client to GlobalComix.
+const DefaultUserAgent = "gc-cli/dev (+https://github.com/tamnd/globalcomix-cli)"
 
-	last time.Time
+// ErrNotFound is returned when a comic or resource is not found.
+var ErrNotFound = errors.New("not found")
+
+// Config holds constructor parameters for Client.
+type Config struct {
+	BaseURL   string
+	UserAgent string
+	Rate      time.Duration
+	Retries   int
+	Timeout   time.Duration
 }
 
-// NewClient returns a Client with sensible defaults: a 30s timeout, a 200ms
-// minimum gap between requests, and five retries on transient errors.
-func NewClient() *Client {
-	return &Client{
-		HTTP:      &http.Client{Timeout: 30 * time.Second},
+// DefaultConfig returns sensible defaults for GlobalComix.
+func DefaultConfig() Config {
+	return Config{
+		BaseURL:   BaseURL,
 		UserAgent: DefaultUserAgent,
-		Rate:      200 * time.Millisecond,
-		Retries:   5,
+		Rate:      300 * time.Millisecond,
+		Retries:   3,
+		Timeout:   30 * time.Second,
 	}
 }
 
-// Get fetches url and returns the response body. It paces and retries according
-// to the client's settings. The caller owns nothing extra; the body is read
-// fully and closed here.
-func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
+// Client is a rate-limited HTTP client for GlobalComix.
+type Client struct {
+	cfg  Config
+	http *http.Client
+	mu   sync.Mutex
+	last time.Time
+}
+
+// NewClient returns a Client configured with cfg.
+func NewClient(cfg Config) *Client {
+	return &Client{
+		cfg:  cfg,
+		http: &http.Client{Timeout: cfg.Timeout},
+	}
+}
+
+// pace blocks until at least cfg.Rate has elapsed since the last request.
+func (c *Client) pace() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.cfg.Rate <= 0 {
+		return
+	}
+	if wait := c.cfg.Rate - time.Since(c.last); wait > 0 {
+		time.Sleep(wait)
+	}
+	c.last = time.Now()
+}
+
+// get fetches a URL with retries on transient errors.
+func (c *Client) get(ctx context.Context, rawURL string) ([]byte, error) {
 	var lastErr error
-	for attempt := 0; attempt <= c.Retries; attempt++ {
+	for attempt := 0; attempt <= c.cfg.Retries; attempt++ {
 		if attempt > 0 {
+			wait := time.Duration(attempt) * 500 * time.Millisecond
+			if wait > 5*time.Second {
+				wait = 5 * time.Second
+			}
 			select {
 			case <-ctx.Done():
 				return nil, ctx.Err()
-			case <-time.After(backoff(attempt)):
+			case <-time.After(wait):
 			}
 		}
-		body, retry, err := c.do(ctx, url)
+		body, retry, err := c.do(ctx, rawURL)
 		if err == nil {
 			return body, nil
 		}
@@ -73,18 +104,19 @@ func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
 			return nil, err
 		}
 	}
-	return nil, fmt.Errorf("get %s: %w", url, lastErr)
+	return nil, fmt.Errorf("get %s: %w", rawURL, lastErr)
 }
 
-func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, err error) {
+func (c *Client) do(ctx context.Context, rawURL string) ([]byte, bool, error) {
 	c.pace()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return nil, false, err
 	}
-	req.Header.Set("User-Agent", c.UserAgent)
+	req.Header.Set("User-Agent", c.cfg.UserAgent)
+	req.Header.Set("Accept", "text/html,application/xhtml+xml")
 
-	resp, err := c.HTTP.Do(req)
+	resp, err := c.http.Do(req)
 	if err != nil {
 		return nil, true, err
 	}
@@ -93,108 +125,353 @@ func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, e
 	if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
 		return nil, true, fmt.Errorf("http %d", resp.StatusCode)
 	}
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, false, ErrNotFound
+	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, false, fmt.Errorf("http %d", resp.StatusCode)
 	}
 
-	b, err := io.ReadAll(resp.Body)
+	b, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 	if err != nil {
 		return nil, true, err
 	}
 	return b, false, nil
 }
 
-// pace blocks until at least Rate has passed since the previous request.
-func (c *Client) pace() {
-	if c.Rate <= 0 {
-		return
-	}
-	if wait := c.Rate - time.Since(c.last); wait > 0 {
-		time.Sleep(wait)
-	}
-	c.last = time.Now()
+// ---- Types ----
+
+// Comic is one comic entry in a listing or search result.
+type Comic struct {
+	Slug        string `json:"slug"`
+	Title       string `json:"title"`
+	Description string `json:"description"`
+	Cover       string `json:"cover"`
+	Language    string `json:"language"`
+	Genres      string `json:"genres"`
+	Authors     string `json:"authors"`
+	URL         string `json:"url"`
 }
 
-func backoff(attempt int) time.Duration {
-	d := time.Duration(attempt) * 500 * time.Millisecond
-	if d > 5*time.Second {
-		d = 5 * time.Second
-	}
-	return d
+// Chapter is one chapter entry in a comic's chapter list.
+type Chapter struct {
+	Slug        string `json:"slug"`
+	Title       string `json:"title"`
+	Number      string `json:"number"`
+	PublishedAt string `json:"published_at"`
+	URL         string `json:"url"`
 }
 
-// Page is the scaffold's one example record: a single page, addressed by the
-// path that names it on globalcomix.com. It is a stand-in for the typed records you
-// will model from the real globalcomix endpoints. The kit struct tags make it
-// addressable as a resource URI (see domain.go): ID is the URI id, and Body is
-// the long text `gc cat` and the Markdown export print.
-type Page struct {
-	ID    string `json:"id" kit:"id"`
-	URL   string `json:"url"`
-	Title string `json:"title,omitempty"`
-	Body  string `json:"body,omitempty" kit:"body"`
+// ComicDetail is the full detail for a comic page.
+type ComicDetail struct {
+	Slug        string    `json:"slug"`
+	Title       string    `json:"title"`
+	Description string    `json:"description"`
+	Cover       string    `json:"cover"`
+	Language    string    `json:"language"`
+	Genres      string    `json:"genres"`
+	Authors     string    `json:"authors"`
+	Chapters    []Chapter `json:"chapters"`
+	URL         string    `json:"url"`
 }
 
-// GetPage fetches one page by its path (for example "wiki/Go") and returns it as
-// a record. The scaffold keeps a plain-text preview of the response as the body;
-// replace the parsing with the real fields once you know the endpoint's shape.
-func (c *Client) GetPage(ctx context.Context, path string) (*Page, error) {
-	path = strings.Trim(path, "/")
-	url := BaseURL + "/" + path
-	body, err := c.Get(ctx, url)
-	if err != nil {
-		return nil, err
-	}
-	return &Page{ID: path, URL: url, Title: path, Body: pageText(body)}, nil
-}
+// ---- HTML Parsing ----
 
-// PageLinks fetches a page and returns the same-host pages it links to, as page
-// stubs. It shows the member-listing pattern the URI driver relies on: every
-// stub carries enough (an id and a URL) to be addressed and followed on its own.
-func (c *Client) PageLinks(ctx context.Context, path string, limit int) ([]*Page, error) {
-	path = strings.Trim(path, "/")
-	body, err := c.Get(ctx, BaseURL+"/"+path)
-	if err != nil {
-		return nil, err
-	}
-	var out []*Page
-	seen := map[string]bool{}
-	for _, p := range linkPaths(body) {
-		if seen[p] {
-			continue
+// parseMeta extracts Open Graph and standard meta content values from an HTML doc.
+func parseMeta(doc *html.Node) map[string]string {
+	out := make(map[string]string)
+	var walk func(*html.Node)
+	walk = func(n *html.Node) {
+		if n.Type == html.ElementNode && n.Data == "meta" {
+			var prop, name, content string
+			for _, a := range n.Attr {
+				switch a.Key {
+				case "property":
+					prop = a.Val
+				case "name":
+					name = a.Val
+				case "content":
+					content = a.Val
+				}
+			}
+			if prop != "" {
+				out[prop] = content
+			}
+			if name != "" {
+				out[name] = content
+			}
 		}
-		seen[p] = true
-		out = append(out, &Page{ID: p, URL: BaseURL + "/" + p})
-		if limit > 0 && len(out) >= limit {
-			break
-		}
-	}
-	return out, nil
-}
-
-var (
-	hrefRE = regexp.MustCompile(`href="(/[^":#?]+)"`)
-	tagRE  = regexp.MustCompile(`<[^>]+>`)
-)
-
-// linkPaths pulls the relative link targets out of an HTML response, so a list
-// op can turn each into an addressable page stub.
-func linkPaths(body []byte) []string {
-	var out []string
-	for _, m := range hrefRE.FindAllSubmatch(body, -1) {
-		if p := strings.Trim(string(m[1]), "/"); p != "" {
-			out = append(out, p)
+		for c := n.FirstChild; c != nil; c = c.NextSibling {
+			walk(c)
 		}
 	}
+	walk(doc)
 	return out
 }
 
-// pageText reduces an HTML response to a short plain-text preview, a stand-in
-// for the typed extract a real endpoint would hand you.
-func pageText(body []byte) string {
-	s := strings.Join(strings.Fields(tagRE.ReplaceAllString(string(body), " ")), " ")
-	if len(s) > 500 {
-		s = s[:500]
+// comicSlugFromHref extracts a comic slug from an href like /a/comics/some-slug
+// or /a/comics/some-slug/chapter-1.
+func comicSlugFromHref(href string) (string, bool) {
+	const prefix = "/a/comics/"
+	if !strings.HasPrefix(href, prefix) {
+		return "", false
 	}
-	return s
+	rest := strings.TrimPrefix(href, prefix)
+	// Take only the first path segment (the slug itself, not chapter sub-paths
+	// that have a "/" after the slug).
+	parts := strings.SplitN(rest, "/", 2)
+	slug := strings.TrimSpace(parts[0])
+	if slug == "" || slug == "top" || slug == "new" || slug == "search" {
+		return "", false
+	}
+	// If there's a second segment, it's a chapter link, not a comic listing link.
+	// We still return the slug so callers can use it.
+	return slug, true
+}
+
+// parseComicCards parses comic listing HTML and extracts Comic stubs.
+// It looks for anchor elements whose href matches the /a/comics/<slug> pattern,
+// deduplicating by slug.
+func parseComicCards(body []byte) ([]Comic, error) {
+	doc, err := html.Parse(strings.NewReader(string(body)))
+	if err != nil {
+		return nil, fmt.Errorf("parse html: %w", err)
+	}
+
+	meta := parseMeta(doc)
+	pageURL := meta["og:url"]
+	if pageURL == "" {
+		pageURL = BaseURL
+	}
+
+	seen := make(map[string]struct{})
+	var out []Comic
+
+	var walk func(*html.Node)
+	walk = func(n *html.Node) {
+		if n.Type == html.ElementNode && n.Data == "a" {
+			for _, a := range n.Attr {
+				if a.Key == "href" {
+					slug, ok := comicSlugFromHref(a.Val)
+					if !ok {
+						break
+					}
+					// Only capture direct comic listing links (no sub-path).
+					if strings.Count(strings.TrimPrefix(a.Val, "/a/comics/"), "/") > 0 {
+						break
+					}
+					if _, seen2 := seen[slug]; seen2 {
+						break
+					}
+					seen[slug] = struct{}{}
+					title := nodeText(n)
+					if title == "" {
+						for _, attr := range n.Attr {
+							if attr.Key == "aria-label" || attr.Key == "title" {
+								title = attr.Val
+								break
+							}
+						}
+					}
+					out = append(out, Comic{
+						Slug:  slug,
+						Title: title,
+						URL:   BaseURL + "/a/comics/" + slug,
+					})
+					break
+				}
+			}
+		}
+		for c := n.FirstChild; c != nil; c = c.NextSibling {
+			walk(c)
+		}
+	}
+	walk(doc)
+	_ = pageURL
+	return out, nil
+}
+
+// parseChapters parses a comic detail page and extracts its chapter list.
+func parseChapters(body []byte, comicSlug string) ([]Chapter, error) {
+	doc, err := html.Parse(strings.NewReader(string(body)))
+	if err != nil {
+		return nil, fmt.Errorf("parse html: %w", err)
+	}
+
+	prefix := "/a/comics/" + comicSlug + "/"
+	seen := make(map[string]struct{})
+	var out []Chapter
+
+	var walk func(*html.Node)
+	walk = func(n *html.Node) {
+		if n.Type == html.ElementNode && n.Data == "a" {
+			for _, a := range n.Attr {
+				if a.Key == "href" && strings.HasPrefix(a.Val, prefix) {
+					chSlug := strings.TrimPrefix(a.Val, prefix)
+					chSlug = strings.Trim(chSlug, "/")
+					if chSlug == "" {
+						break
+					}
+					if _, dup := seen[chSlug]; dup {
+						break
+					}
+					seen[chSlug] = struct{}{}
+					text := strings.TrimSpace(nodeText(n))
+					num, title := parseChapterText(text)
+					out = append(out, Chapter{
+						Slug:   chSlug,
+						Number: num,
+						Title:  title,
+						URL:    BaseURL + a.Val,
+					})
+					break
+				}
+			}
+		}
+		for c := n.FirstChild; c != nil; c = c.NextSibling {
+			walk(c)
+		}
+	}
+	walk(doc)
+	return out, nil
+}
+
+// parseChapterText splits "Chapter 1 - Some Title" into ("1", "Some Title").
+func parseChapterText(s string) (num, title string) {
+	s = strings.TrimSpace(s)
+	lower := strings.ToLower(s)
+	for _, prefix := range []string{"chapter ", "ch. ", "ch "} {
+		if idx := strings.Index(lower, prefix); idx >= 0 {
+			rest := strings.TrimSpace(s[idx+len(prefix):])
+			// rest might be "1 - Some Title" or "1: Some Title" or just "1"
+			for _, sep := range []string{" - ", ": ", " "} {
+				if i := strings.Index(rest, sep); i >= 0 {
+					num = strings.TrimSpace(rest[:i])
+					title = strings.TrimSpace(rest[i+len(sep):])
+					return
+				}
+			}
+			num = rest
+			return
+		}
+	}
+	// No "chapter" keyword; use the full text as title.
+	title = s
+	return
+}
+
+// nodeText returns the concatenated text content of a node and its descendants.
+func nodeText(n *html.Node) string {
+	var sb strings.Builder
+	var walk func(*html.Node)
+	walk = func(n *html.Node) {
+		if n.Type == html.TextNode {
+			sb.WriteString(n.Data)
+		}
+		for c := n.FirstChild; c != nil; c = c.NextSibling {
+			walk(c)
+		}
+	}
+	walk(n)
+	return strings.TrimSpace(sb.String())
+}
+
+// parseComicDetail extracts the main metadata from a comic detail page.
+func parseComicDetail(body []byte, slug string) (*ComicDetail, error) {
+	doc, err := html.Parse(strings.NewReader(string(body)))
+	if err != nil {
+		return nil, fmt.Errorf("parse html: %w", err)
+	}
+	meta := parseMeta(doc)
+	chapters, _ := parseChapters(body, slug)
+	return &ComicDetail{
+		Slug:        slug,
+		Title:       meta["og:title"],
+		Description: meta["og:description"],
+		Cover:       meta["og:image"],
+		URL:         BaseURL + "/a/comics/" + slug,
+		Chapters:    chapters,
+	}, nil
+}
+
+// ---- API Methods ----
+
+// Trending fetches trending comics from the listing page.
+func (c *Client) Trending(ctx context.Context, page int) ([]Comic, error) {
+	if page < 1 {
+		page = 1
+	}
+	rawURL := fmt.Sprintf("%s/a/comics/top?language=en&page=%d", c.cfg.BaseURL, page)
+	body, err := c.get(ctx, rawURL)
+	if err != nil {
+		return nil, err
+	}
+	return parseComicCards(body)
+}
+
+// New fetches newly added comics from the listing page.
+func (c *Client) New(ctx context.Context, page int) ([]Comic, error) {
+	if page < 1 {
+		page = 1
+	}
+	rawURL := fmt.Sprintf("%s/a/comics/new?language=en&page=%d", c.cfg.BaseURL, page)
+	body, err := c.get(ctx, rawURL)
+	if err != nil {
+		return nil, err
+	}
+	return parseComicCards(body)
+}
+
+// Search searches for comics by query.
+func (c *Client) Search(ctx context.Context, q string, page int) ([]Comic, error) {
+	if page < 1 {
+		page = 1
+	}
+	rawURL := fmt.Sprintf("%s/a/search?query=%s&page=%d", c.cfg.BaseURL, urlEncode(q), page)
+	body, err := c.get(ctx, rawURL)
+	if err != nil {
+		return nil, err
+	}
+	return parseComicCards(body)
+}
+
+// GetComic fetches the detail page for a comic by slug.
+func (c *Client) GetComic(ctx context.Context, slug string) (*ComicDetail, error) {
+	rawURL := fmt.Sprintf("%s/a/comics/%s", c.cfg.BaseURL, slug)
+	body, err := c.get(ctx, rawURL)
+	if err != nil {
+		return nil, err
+	}
+	return parseComicDetail(body, slug)
+}
+
+// GetChapters fetches the chapter list for a comic by slug.
+func (c *Client) GetChapters(ctx context.Context, slug string) ([]Chapter, error) {
+	detail, err := c.GetComic(ctx, slug)
+	if err != nil {
+		return nil, err
+	}
+	return detail.Chapters, nil
+}
+
+// urlEncode is a minimal URL query-string encoder.
+func urlEncode(s string) string {
+	var sb strings.Builder
+	for _, b := range []byte(s) {
+		if isURLSafe(b) {
+			sb.WriteByte(b)
+		} else if b == ' ' {
+			sb.WriteByte('+')
+		} else {
+			fmt.Fprintf(&sb, "%%%02X", b)
+		}
+	}
+	return sb.String()
+}
+
+func isURLSafe(b byte) bool {
+	return (b >= 'a' && b <= 'z') ||
+		(b >= 'A' && b <= 'Z') ||
+		(b >= '0' && b <= '9') ||
+		b == '-' || b == '_' || b == '.' || b == '~'
 }
