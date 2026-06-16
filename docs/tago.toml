@@ -1,0 +1,10 @@
+title       = "gc"
+baseURL     = "https://globalcomix-cli.tamnd.com/"
+description = "Browse GlobalComix comics catalog"
+contentDir  = "content"
+outputDir   = "public"
+theme       = "tago-doks"
+syntaxHighlight = "true"
+
+[params]
+github = "https://github.com/tamnd/globalcomix-cli"
